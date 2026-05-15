@@ -182,17 +182,84 @@ def build_employee_summary(historical_df: pd.DataFrame, employee_name: str) -> d
     }
 
 
+# def create_opportunity_finder(recommendations_df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Find hidden opportunity areas.
+
+#     Logic:
+#     A high-opportunity row means:
+#     - employee has a high recommendation score
+#     - but observed usage/exposure is relatively low
+
+#     In simple terms:
+#     This employee appears strong for this combo, but may not be used enough there.
+#     """
+#     df = recommendations_df.copy()
+
+#     score_col = get_score_col(df)
+
+#     if score_col is None:
+#         raise ValueError(
+#             "No recommendation score column found. Expected recency_recommendation_score, recency_score, or recommendation_score."
+#         )
+
+#     if "observed_days" not in df.columns:
+#         raise ValueError("observed_days column is required for Opportunity Finder.")
+
+#     # High score cutoff based on top 25 percent of recommendation scores
+#     high_score_cutoff = df[score_col].quantile(HIGH_SCORE_PERCENTILE)
+
+#     # Low usage cutoff based on lower 35 percent of observed days
+#     low_usage_cutoff = df["observed_days"].quantile(LOW_USAGE_PERCENTILE)
+
+#     df["high_score_flag"] = df[score_col] >= high_score_cutoff
+#     df["low_usage_flag"] = df["observed_days"] <= low_usage_cutoff
+
+#     df["opportunity_flag"] = df["high_score_flag"] & df["low_usage_flag"]
+
+#     # Opportunity score rewards high recommendation score and low usage.
+#     # Lower observed_days means more potential opportunity.
+#     max_observed_days = df["observed_days"].max()
+
+#     if pd.isna(max_observed_days) or max_observed_days == 0:
+#         df["usage_gap_score"] = 0
+#     else:
+#         df["usage_gap_score"] = 1 - (df["observed_days"] / max_observed_days)
+
+#     df["opportunity_score"] = df[score_col] * df["usage_gap_score"]
+
+#     def opportunity_label(row):
+#         if row["opportunity_flag"]:
+#             return "High Opportunity"
+
+#         if row["high_score_flag"]:
+#             return "Strong but already used"
+
+#         if row["low_usage_flag"]:
+#             return "Low exposure"
+
+#         return "Normal"
+
+#     df["opportunity_label"] = df.apply(opportunity_label, axis=1)
+
+#     opportunity_df = df.sort_values(
+#         ["opportunity_flag", "opportunity_score", score_col],
+#         ascending=[False, False, False],
+#     ).reset_index(drop=True)
+
+#     return opportunity_df
+
 def create_opportunity_finder(recommendations_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Find hidden opportunity areas.
+    Find hidden opportunity areas using combo-specific logic.
 
     Logic:
     A high-opportunity row means:
-    - employee has a high recommendation score
-    - but observed usage/exposure is relatively low
+    - employee is strong compared to other employees within the same TestName / PayorName
+    - but has relatively low usage/exposure within that same TestName / PayorName
 
     In simple terms:
-    This employee appears strong for this combo, but may not be used enough there.
+    This employee appears strong for this specific combo, but may not be used enough there.
     """
     df = recommendations_df.copy()
 
@@ -203,30 +270,111 @@ def create_opportunity_finder(recommendations_df: pd.DataFrame) -> pd.DataFrame:
             "No recommendation score column found. Expected recency_recommendation_score, recency_score, or recommendation_score."
         )
 
-    if "observed_days" not in df.columns:
-        raise ValueError("observed_days column is required for Opportunity Finder.")
+    required_cols = {
+        "matched_employee_name",
+        "testname",
+        "payorname",
+        "observed_days",
+    }
 
-    # High score cutoff based on top 25 percent of recommendation scores
-    high_score_cutoff = df[score_col].quantile(HIGH_SCORE_PERCENTILE)
+    missing_cols = required_cols - set(df.columns)
 
-    # Low usage cutoff based on lower 35 percent of observed days
-    low_usage_cutoff = df["observed_days"].quantile(LOW_USAGE_PERCENTILE)
+    if missing_cols:
+        raise ValueError(f"Missing required columns for Opportunity Finder: {missing_cols}")
 
-    df["high_score_flag"] = df[score_col] >= high_score_cutoff
-    df["low_usage_flag"] = df["observed_days"] <= low_usage_cutoff
+    # Make sure observed_days is numeric
+    df["observed_days"] = pd.to_numeric(df["observed_days"], errors="coerce").fillna(0)
+
+    combo_cols = ["testname", "payorname"]
+
+    # ------------------------------------------------------------
+    # 1. Combo-specific score percentile
+    # ------------------------------------------------------------
+    # For each TestName / PayorName combination:
+    # - rank employees by recommendation score
+    # - convert rank into percentile
+    # - employees in the top 25% for that combo are treated as high-score candidates
+    # ------------------------------------------------------------
+
+    df["combo_score_percentile"] = (
+        df.groupby(combo_cols)[score_col]
+        .rank(pct=True, ascending=True, method="average")
+    )
+
+    df["high_score_flag"] = df["combo_score_percentile"] >= HIGH_SCORE_PERCENTILE
+
+    # ------------------------------------------------------------
+    # 2. Combo-specific low usage cutoff
+    # ------------------------------------------------------------
+    # Instead of checking low observed_days globally, we check whether the employee
+    # has low exposure compared to other employees for the same TestName / PayorName.
+    # ------------------------------------------------------------
+
+    df["combo_low_usage_cutoff"] = (
+        df.groupby(combo_cols)["observed_days"]
+        .transform(lambda s: s.quantile(LOW_USAGE_PERCENTILE))
+    )
+
+    df["combo_min_observed_days"] = (
+        df.groupby(combo_cols)["observed_days"]
+        .transform("min")
+    )
+
+    df["combo_max_observed_days"] = (
+        df.groupby(combo_cols)["observed_days"]
+        .transform("max")
+    )
+
+    # This avoids incorrectly flagging everyone as low usage when all employees
+    # have the same observed_days for a combo.
+    df["combo_usage_has_variation"] = (
+        df["combo_max_observed_days"] > df["combo_min_observed_days"]
+    )
+
+    df["low_usage_flag"] = (
+        (df["observed_days"] <= df["combo_low_usage_cutoff"])
+        & df["combo_usage_has_variation"]
+    )
+
+    # ------------------------------------------------------------
+    # 3. Opportunity flag
+    # ------------------------------------------------------------
+    # A true opportunity means:
+    # strong within this combo AND underused within this combo.
+    # ------------------------------------------------------------
 
     df["opportunity_flag"] = df["high_score_flag"] & df["low_usage_flag"]
 
-    # Opportunity score rewards high recommendation score and low usage.
-    # Lower observed_days means more potential opportunity.
-    max_observed_days = df["observed_days"].max()
+    # ------------------------------------------------------------
+    # 4. Usage gap score
+    # ------------------------------------------------------------
+    # Lower observed_days compared to the max observed_days in the same combo
+    # means higher potential opportunity.
+    # ------------------------------------------------------------
 
-    if pd.isna(max_observed_days) or max_observed_days == 0:
-        df["usage_gap_score"] = 0
-    else:
-        df["usage_gap_score"] = 1 - (df["observed_days"] / max_observed_days)
+    df["usage_gap_score"] = np.where(
+        df["combo_max_observed_days"] > 0,
+        1 - (df["observed_days"] / df["combo_max_observed_days"]),
+        0,
+    )
 
-    df["opportunity_score"] = df[score_col] * df["usage_gap_score"]
+    df["usage_gap_score"] = df["usage_gap_score"].clip(lower=0, upper=1)
+
+    # ------------------------------------------------------------
+    # 5. Opportunity score
+    # ------------------------------------------------------------
+    # We use combo_score_percentile instead of raw score so the opportunity score
+    # is fairer across combinations with different score distributions.
+    # ------------------------------------------------------------
+
+    df["opportunity_score"] = (
+        df["combo_score_percentile"].fillna(0)
+        * df["usage_gap_score"].fillna(0)
+    )
+
+    # ------------------------------------------------------------
+    # 6. Human-readable label
+    # ------------------------------------------------------------
 
     def opportunity_label(row):
         if row["opportunity_flag"]:
@@ -242,10 +390,22 @@ def create_opportunity_finder(recommendations_df: pd.DataFrame) -> pd.DataFrame:
 
     df["opportunity_label"] = df.apply(opportunity_label, axis=1)
 
-    opportunity_df = df.sort_values(
-        ["opportunity_flag", "opportunity_score", score_col],
-        ascending=[False, False, False],
-    ).reset_index(drop=True)
+    # ------------------------------------------------------------
+    # 7. Sort most useful opportunities to the top
+    # ------------------------------------------------------------
+
+    opportunity_df = (
+        df.sort_values(
+            [
+                "opportunity_flag",
+                "opportunity_score",
+                "combo_score_percentile",
+                score_col,
+            ],
+            ascending=[False, False, False, False],
+        )
+        .reset_index(drop=True)
+    )
 
     return opportunity_df
 

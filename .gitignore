@@ -1,3 +1,6 @@
 snowflake_config.json
 employee_case_analysis_outputs/
 __pycache__/
+Updated_COBS.sql
+Updated_Denial_Summary.sql
+Combined_Roster_View.sql
